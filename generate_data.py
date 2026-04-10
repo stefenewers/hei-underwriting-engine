@@ -1,16 +1,14 @@
 """
-Synthetic HEI Deal Data Generator
-====================================
-Generates a realistic training dataset for the HEI Underwriting Engine.
+Synthetic HEI Deal Data Generator — v2
+=======================================
+Generates a realistic 28-feature training dataset for the HEI Underwriting Engine.
 
-Design philosophy:
-  - HEI investment amounts are back-computed from a target IRR distribution,
-    mirroring how real operators size deals (not random sampling).
-  - A deliberate mix of good, borderline, and bad deals is constructed to
-    prevent class collapse.
-  - Distributions are anchored to real HEI market parameters observed in
-    Splitero, Unlock, Point, and Hometap deal flow disclosures.
-  - Appreciation rates are calibrated against Zillow ZHVI 5-year CAGR data.
+New in v2:
+  - CLTV with subordinate liens (HELOC, 2nd mortgage, tax/HOA liens)
+  - Foreclosure, bankruptcy, and delinquency history flags
+  - Property type risk, property age, owner-occupied, ARM, flood zone
+  - DTI ratio and employment stability tier
+  - IRR-anchored investment sizing (not random amounts)
 """
 
 from typing import Tuple
@@ -18,14 +16,15 @@ import numpy as np
 import pandas as pd
 from hei_engine import (
     FEATURE_NAMES,
+    STATE_APPRECIATION,
     compute_irr_distribution,
     engineer_features,
-    STATE_APPRECIATION,
-    calculate_irr,
+    get_flood_risk,
+    get_market_liquidity,
 )
 
 RNG = np.random.default_rng(42)
-N_SAMPLES = 8_000
+N_SAMPLES = 10_000
 
 
 # ---------------------------------------------------------------------------
@@ -33,42 +32,36 @@ N_SAMPLES = 8_000
 # ---------------------------------------------------------------------------
 
 def sample_property_value() -> float:
-    """Log-normal distribution centered around $475K (realistic HEI target)."""
     return float(np.clip(RNG.lognormal(mean=13.07, sigma=0.55), 150_000, 3_000_000))
 
 
 def sample_ltv() -> float:
-    """
-    LTV at origination. HEI operators typically require < 80% LTV.
-    Beta distribution skewed toward 30–60% range.
-    """
     return float(np.clip(RNG.beta(a=3.0, b=4.5), 0.0, 0.82))
 
 
-def sample_credit_score() -> int:
-    """Normal distribution; HEI operators generally require 580+ minimum."""
-    return int(np.clip(RNG.normal(loc=720, scale=65), 560, 850))
+def sample_credit_score(tier: str) -> int:
+    """Sample credit score from a tier-aware distribution."""
+    if tier == "good":
+        return int(np.clip(RNG.normal(735, 40), 680, 850))
+    elif tier == "fair":
+        return int(np.clip(RNG.normal(660, 35), 600, 720))
+    else:
+        return int(np.clip(RNG.normal(590, 30), 540, 650))
 
 
 def sample_equity_share() -> float:
-    """Equity share % offered to operator. Typical range: 10–30%."""
     return float(np.clip(RNG.beta(a=2.5, b=5.0) * 0.35 + 0.08, 0.10, 0.30))
 
 
 def sample_cap_multiple() -> float:
-    """Cap expressed as multiple of investment. Typical: 1.5–3.0×."""
     return float(np.clip(RNG.normal(loc=2.2, scale=0.4), 1.5, 3.5))
 
 
 def sample_term() -> int:
-    """Investment horizon: most HEIs run 5 or 10 years."""
     return int(RNG.choice([5, 10], p=[0.35, 0.65]))
 
 
 def sample_appreciation_cagr(state_cagr: float) -> Tuple[float, float, float]:
-    """
-    Sample appreciation distribution (P10, P50, P90) around metro baseline.
-    """
     sigma = 0.025
     p50 = float(np.clip(state_cagr + RNG.normal(0, 0.012), 0.01, 0.18))
     p10 = float(np.clip(p50 - 2 * sigma, 0.005, p50))
@@ -77,14 +70,95 @@ def sample_appreciation_cagr(state_cagr: float) -> Tuple[float, float, float]:
 
 
 def sample_state() -> str:
-    """Sample states with weight toward higher-appreciation markets."""
     states = list(STATE_APPRECIATION.keys())
     weights = np.array([STATE_APPRECIATION[s] for s in states])
     weights = weights / weights.sum()
     return str(RNG.choice(states, p=weights))
 
 
-def compute_hei_amount_from_target_irr(
+def sample_liens(equity: float, credit_tier_label: str) -> Tuple[float, float, float, float]:
+    """
+    Sample subordinate liens: HELOC, 2nd mortgage, tax lien, HOA lien.
+    Good-credit borrowers have cleaner lien profiles.
+    """
+    # HELOC: ~40% of borrowers have one
+    heloc_prob = 0.20 if credit_tier_label == "good" else 0.35 if credit_tier_label == "fair" else 0.15
+    if RNG.random() < heloc_prob:
+        heloc_balance = float(RNG.uniform(5_000, min(equity * 0.25, 100_000)))
+    else:
+        heloc_balance = 0.0
+
+    # Second mortgage: ~15% of borrowers
+    second_prob = 0.05 if credit_tier_label == "good" else 0.15 if credit_tier_label == "fair" else 0.25
+    second_max = min(equity * 0.20, 80_000)
+    if RNG.random() < second_prob and second_max > 10_000:
+        second_mortgage = float(RNG.uniform(10_000, second_max))
+    else:
+        second_mortgage = 0.0
+
+    # Tax lien: rare, more common in distressed profiles
+    tax_prob = 0.01 if credit_tier_label == "good" else 0.04 if credit_tier_label == "fair" else 0.12
+    tax_lien = float(RNG.uniform(1_000, 25_000)) if RNG.random() < tax_prob else 0.0
+
+    # HOA lien: present when HOA exists and homeowner has arrears
+    hoa_prob = 0.01 if credit_tier_label == "good" else 0.03 if credit_tier_label == "fair" else 0.08
+    hoa_lien = float(RNG.uniform(500, 8_000)) if RNG.random() < hoa_prob else 0.0
+
+    return heloc_balance, second_mortgage, tax_lien, hoa_lien
+
+
+def sample_credit_history(credit_tier_label: str) -> Tuple[int, int, int]:
+    """
+    Sample foreclosure, bankruptcy, and delinquency flags.
+    Correlated with credit tier.
+    """
+    if credit_tier_label == "good":
+        foreclosure = int(RNG.random() < 0.005)
+        bankruptcy = int(RNG.random() < 0.005)
+        delinquency = int(RNG.random() < 0.03)
+    elif credit_tier_label == "fair":
+        foreclosure = int(RNG.random() < 0.04)
+        bankruptcy = int(RNG.random() < 0.03)
+        delinquency = int(RNG.random() < 0.15)
+    else:
+        foreclosure = int(RNG.random() < 0.20)
+        bankruptcy = int(RNG.random() < 0.15)
+        delinquency = int(RNG.random() < 0.40)
+    return foreclosure, bankruptcy, delinquency
+
+
+def sample_property_attributes() -> Tuple[int, int, int, int]:
+    """
+    Returns: (property_type_risk, property_age, owner_occupied, arm_flag)
+    """
+    # Property type: mostly SFR in HEI programs
+    prop_type = int(RNG.choice([0, 1, 2, 3], p=[0.68, 0.15, 0.15, 0.02]))
+    # Property age: 1-80 years (log-normal skewed toward newer homes)
+    prop_age = int(np.clip(RNG.lognormal(mean=3.2, sigma=0.7), 1, 80))
+    # Owner-occupied: required by most programs, ~5% slip through as investment
+    owner_occ = int(RNG.random() > 0.05)
+    # ARM flag: ~18% of mortgages are adjustable
+    arm = int(RNG.random() < 0.18)
+    return prop_type, prop_age, owner_occ, arm
+
+
+def sample_homeowner_financials(credit_tier_label: str) -> Tuple[float, int]:
+    """
+    Returns: (dti_ratio, employment_stability_tier)
+    """
+    if credit_tier_label == "good":
+        dti = float(np.clip(RNG.beta(a=3.0, b=5.0) * 0.55 + 0.10, 0.10, 0.55))
+        emp_tier = int(RNG.choice([2, 1, 0], p=[0.78, 0.18, 0.04]))
+    elif credit_tier_label == "fair":
+        dti = float(np.clip(RNG.beta(a=2.5, b=3.5) * 0.60 + 0.15, 0.15, 0.65))
+        emp_tier = int(RNG.choice([2, 1, 0], p=[0.60, 0.28, 0.12]))
+    else:
+        dti = float(np.clip(RNG.beta(a=2.0, b=2.5) * 0.65 + 0.20, 0.20, 0.75))
+        emp_tier = int(RNG.choice([2, 1, 0], p=[0.40, 0.35, 0.25]))
+    return dti, emp_tier
+
+
+def compute_hei_amount(
     target_irr: float,
     equity_share: float,
     property_value: float,
@@ -93,108 +167,121 @@ def compute_hei_amount_from_target_irr(
     term_years: int,
     equity: float,
 ) -> float:
-    """
-    Back-compute HEI investment amount to achieve a target IRR.
-
-    IRR formula: net_return = investment * (1 + target_irr)^term
-    net_return = min(equity_share * property_value * total_appreciation, cap_amount)
-
-    Solve for investment given target_irr:
-      gross_return = equity_share * property_value * ((1+cagr)^term - 1)
-      For below-cap regime: investment = gross_return / (1 + target_irr)^term
-    """
     total_appreciation = (1 + appreciation_cagr) ** term_years - 1
     gross_return = equity_share * property_value * total_appreciation
-
     if gross_return <= 0:
         return max(equity * 0.05, 10_000)
-
-    # Required investment for target IRR (ignoring cap initially)
-    compounding = (1 + target_irr) ** term_years
-    if compounding <= 0:
-        compounding = 0.01
-
+    compounding = max((1 + target_irr) ** term_years, 0.01)
     investment = gross_return / compounding
-
-    # Check if cap would bind at this investment level
-    cap_amount = cap_multiple * investment
-    if gross_return > cap_amount:
-        # Cap binds: solve for investment such that cap_amount = gross_return / compounding
-        # cap_multiple * investment = gross_return / (1 + target_irr)^term
-        # investment = gross_return / (compounding * cap_multiple)
-        # But this is circular... use the uncapped version and accept cap effect
-        pass  # Use uncapped investment as-is; label assignment handles this
-
-    # Bound to reasonable limits
-    max_investment = min(equity * 0.60, 500_000)
-    min_investment = max(equity * 0.03, 10_000)
-    return float(np.clip(investment, min_investment, max_investment))
+    return float(np.clip(investment, max(equity * 0.03, 10_000), min(equity * 0.65, 500_000)))
 
 
 # ---------------------------------------------------------------------------
-# Label assignment (expert heuristic underwriting rules)
+# Label assignment — v2 (expanded business rules)
 # ---------------------------------------------------------------------------
 
 def assign_label(
     irr_base: float,
     ltv: float,
+    cltv: float,
     credit_score: int,
     equity_pct: float,
     cap_exceedance_prob: float,
     hei_to_equity: float,
+    foreclosure_flag: int,
+    bankruptcy_flag: int,
+    mortgage_delinquency_flag: int,
+    owner_occupied: int,
+    property_type_risk: int,
+    dti_ratio: float,
+    subordinate_lien_count: int,
 ) -> str:
-    """
-    Business rule labeler mimicking HEI operator underwriting criteria.
-
-    APPROVE  : Strong IRR, solid collateral, good credit
-    REVIEW   : Borderline on one or more dimensions
-    REJECT   : Fails one or more hard underwriting thresholds
-    """
-    # Hard rejects
+    # ---- Hard rejects ----
+    if foreclosure_flag:
+        return "REJECT"
+    if bankruptcy_flag:
+        return "REJECT"
+    if not owner_occupied:
+        return "REJECT"
+    if property_type_risk >= 3:          # manufactured home
+        return "REJECT"
+    if cltv > 0.90:                       # combined position too risky
+        return "REJECT"
     if ltv > 0.82:
         return "REJECT"
     if credit_score < 580:
         return "REJECT"
-    if irr_base < 0.02:          # < 2% annualized is unacceptable
+    if irr_base < 0.02:
         return "REJECT"
     if equity_pct < 0.08:
         return "REJECT"
     if hei_to_equity > 0.75:
         return "REJECT"
+    if dti_ratio > 0.65:
+        return "REJECT"
 
-    # Scoring system
-    score = 0
+    # ---- Soft flags that push toward REVIEW ----
+    review_flags = 0
+    if mortgage_delinquency_flag:
+        review_flags += 2
+    if cltv > 0.80:
+        review_flags += 2
+    if ltv > 0.70:
+        review_flags += 1
+    if credit_score < 640:
+        review_flags += 2
+    if irr_base < 0.05:
+        review_flags += 2
+    if dti_ratio > 0.50:
+        review_flags += 1
+    if subordinate_lien_count >= 2:
+        review_flags += 1
+    if property_type_risk == 2:          # condo
+        review_flags += 1
 
+    # ---- Positive signals ----
+    approve_score = 0
     if irr_base >= 0.14:
-        score += 3
+        approve_score += 3
     elif irr_base >= 0.09:
-        score += 2
+        approve_score += 2
     elif irr_base >= 0.05:
-        score += 1
+        approve_score += 1
 
     if ltv <= 0.50:
-        score += 3
+        approve_score += 3
     elif ltv <= 0.65:
-        score += 2
+        approve_score += 2
     elif ltv <= 0.75:
-        score += 1
+        approve_score += 1
+
+    if cltv <= 0.65:
+        approve_score += 2
+    elif cltv <= 0.75:
+        approve_score += 1
 
     if credit_score >= 740:
-        score += 3
+        approve_score += 3
     elif credit_score >= 680:
-        score += 2
+        approve_score += 2
     elif credit_score >= 620:
-        score += 1
+        approve_score += 1
 
     if cap_exceedance_prob <= 0.20:
-        score += 1
-
+        approve_score += 1
     if equity_pct >= 0.40:
-        score += 1
+        approve_score += 1
+    if dti_ratio <= 0.36:
+        approve_score += 1
+    if subordinate_lien_count == 0:
+        approve_score += 1
 
-    if score >= 7:
+    # Decision
+    if review_flags >= 3:
+        return "REVIEW" if approve_score >= 3 else "REJECT"
+    if approve_score >= 8:
         return "APPROVE"
-    elif score >= 3:
+    elif approve_score >= 3:
         return "REVIEW"
     else:
         return "REJECT"
@@ -205,67 +292,72 @@ def assign_label(
 # ---------------------------------------------------------------------------
 
 def generate_dataset(n: int = N_SAMPLES) -> pd.DataFrame:
-    """
-    Generate synthetic HEI deals with a controlled mix:
-      ~35% APPROVE, ~40% REVIEW, ~25% REJECT
-    via stratified sampling of target IRR tiers.
-    """
     records = []
 
-    # IRR tier mix: good / borderline / bad deals
+    # Target IRR tiers to get a balanced class distribution
     tier_config = [
-        # (target_irr_mean, target_irr_std, fraction)
-        (0.155, 0.04, 0.35),   # Good deals: 12–20% target IRR
-        (0.065, 0.03, 0.40),   # Borderline: 3–10% target IRR
-        (-0.05, 0.08, 0.25),   # Bad deals: negative/near-zero target IRR
+        ("good",  0.155, 0.04, 0.38),
+        ("fair",  0.065, 0.03, 0.40),
+        ("poor",  -0.04, 0.08, 0.22),
     ]
+    tier_counts = [int(n * f) for _, _, _, f in tier_config]
+    tier_counts[-1] = n - sum(tier_counts[:-1])
 
-    tier_counts = [int(n * f) for _, _, f in tier_config]
-    tier_counts[-1] = n - sum(tier_counts[:-1])  # handle rounding
-
-    for (irr_mean, irr_std, _), count in zip(tier_config, tier_counts):
+    for (credit_tier_label, irr_mean, irr_std, _), count in zip(tier_config, tier_counts):
         for _ in range(count):
             state = sample_state()
             base_cagr = STATE_APPRECIATION[state]
-
             p10, p50, p90 = sample_appreciation_cagr(base_cagr)
+
             property_value = sample_property_value()
             ltv = sample_ltv()
             outstanding_mortgage = ltv * property_value
-            equity = property_value - outstanding_mortgage
-            credit_score = sample_credit_score()
+            equity = max(property_value - outstanding_mortgage, 1.0)
+            credit_score = sample_credit_score(credit_tier_label)
             equity_share_pct = sample_equity_share()
             cap_multiple = sample_cap_multiple()
             term_years = sample_term()
 
-            # Sample target IRR for this tier, then back-compute investment
+            # Liens
+            heloc_balance, second_mortgage, tax_lien, hoa_lien = sample_liens(equity, credit_tier_label)
+            total_debt = outstanding_mortgage + heloc_balance + second_mortgage + tax_lien + hoa_lien
+            cltv = total_debt / max(property_value, 1.0)
+
+            # Credit history
+            foreclosure_flag, bankruptcy_flag, delinquency_flag = sample_credit_history(credit_tier_label)
+
+            # Property attributes
+            prop_type, prop_age, owner_occ, arm_flag = sample_property_attributes()
+
+            # Homeowner financials
+            dti_ratio, emp_tier = sample_homeowner_financials(credit_tier_label)
+
+            # HEI amount (back-computed from target IRR)
             target_irr = float(np.clip(RNG.normal(irr_mean, irr_std), -0.30, 0.40))
-
-            hei_amount = compute_hei_amount_from_target_irr(
-                target_irr=target_irr,
-                equity_share=equity_share_pct,
-                property_value=property_value,
-                appreciation_cagr=p50,
-                cap_multiple=cap_multiple,
-                term_years=term_years,
-                equity=equity,
-            )
-
-            # Small random perturbation to avoid perfectly deterministic data
-            hei_amount = float(np.clip(
-                hei_amount * RNG.uniform(0.85, 1.15),
-                max(equity * 0.03, 10_000),
-                min(equity * 0.65, 500_000),
-            ))
+            hei_amount = compute_hei_amount(target_irr, equity_share_pct, property_value, p50, cap_multiple, term_years, equity)
+            hei_amount = float(np.clip(hei_amount * RNG.uniform(0.85, 1.15), max(equity * 0.03, 10_000), min(equity * 0.65, 500_000)))
 
             if equity <= 0 or hei_amount <= 0:
                 continue
 
-            # Engineer features (same pipeline as inference)
+            # Engineer features
             feat_df = engineer_features(
                 property_value=property_value,
                 outstanding_mortgage=outstanding_mortgage,
+                heloc_balance=heloc_balance,
+                second_mortgage_balance=second_mortgage,
+                tax_lien_amount=tax_lien,
+                hoa_lien_amount=hoa_lien,
                 credit_score=credit_score,
+                foreclosure_flag=foreclosure_flag,
+                bankruptcy_flag=bankruptcy_flag,
+                mortgage_delinquency_flag=delinquency_flag,
+                dti_ratio=dti_ratio,
+                employment_stability_tier=emp_tier,
+                property_type_risk=prop_type,
+                property_age=prop_age,
+                owner_occupied=owner_occ,
+                arm_flag=arm_flag,
                 hei_amount=hei_amount,
                 equity_share_pct=equity_share_pct,
                 cap_multiple=cap_multiple,
@@ -273,21 +365,20 @@ def generate_dataset(n: int = N_SAMPLES) -> pd.DataFrame:
                 appreciation_cagr=p50,
                 appreciation_p10=p10,
                 appreciation_p90=p90,
+                state=state,
             )
 
-            irr_data = compute_irr_distribution(
-                hei_amount, equity_share_pct, property_value,
-                p10, p50, p90, cap_multiple, term_years
-            )
-
+            irr_data = compute_irr_distribution(hei_amount, equity_share_pct, property_value, p10, p50, p90, cap_multiple, term_years)
             irr_base = irr_data["base_irr"] / 100
-            cap_exceedance_prob = irr_data["cap_exceedance_prob"]
-            equity_pct_val = (equity / property_value) if property_value > 0 else 0
             hei_to_equity = hei_amount / max(equity, 1)
+            equity_pct_val = equity / max(property_value, 1)
+            subordinate_count = sum([heloc_balance > 0, second_mortgage > 0, tax_lien > 0, hoa_lien > 0])
 
             label = assign_label(
-                irr_base, ltv, credit_score, equity_pct_val,
-                cap_exceedance_prob, hei_to_equity
+                irr_base, ltv, cltv, credit_score, equity_pct_val,
+                irr_data["cap_exceedance_prob"], hei_to_equity,
+                foreclosure_flag, bankruptcy_flag, delinquency_flag,
+                owner_occ, prop_type, dti_ratio, subordinate_count,
             )
 
             row = feat_df.iloc[0].to_dict()
@@ -299,13 +390,15 @@ def generate_dataset(n: int = N_SAMPLES) -> pd.DataFrame:
             row["_irr_bear"] = irr_data["scenarios"]["bear"]["irr"]
             row["_irr_base"] = irr_data["scenarios"]["base"]["irr"]
             row["_irr_bull"] = irr_data["scenarios"]["bull"]["irr"]
+            row["_cltv"] = cltv
 
             records.append(row)
 
     df = pd.DataFrame(records)
     print(f"Generated {len(df)} deals")
     print(df["label"].value_counts())
-    print(f"\nIRR base stats:\n{df['_irr_base'].describe().round(2)}")
+    print(f"\nIRR base: mean={df['_irr_base'].mean():.2f}% | median={df['_irr_base'].median():.2f}%")
+    print(f"CLTV: mean={df['_cltv'].mean():.2%} | max={df['_cltv'].max():.2%}")
     return df
 
 

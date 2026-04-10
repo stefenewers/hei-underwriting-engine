@@ -43,16 +43,35 @@ MODELS_DIR.mkdir(exist_ok=True)
 DATA_DIR.mkdir(exist_ok=True)
 
 FEATURE_COLS = [
+    # Collateral / LTV
     "ltv",
+    "cltv",
     "equity_pct",
     "hei_to_equity_ratio",
+    "subordinate_lien_count",
+    "heloc_utilization",
+    # Creditworthiness
     "credit_tier",
+    "foreclosure_flag",
+    "bankruptcy_flag",
+    "mortgage_delinquency_flag",
+    "dti_ratio",
+    "employment_stability_tier",
+    # Property quality
+    "property_type_risk",
+    "property_age_normalized",
+    "owner_occupied",
+    "flood_zone_risk",
+    "arm_flag",
+    # Market & deal
     "log_property_value",
     "appreciation_cagr",
     "appreciation_5yr_total",
+    "market_liquidity_score",
     "cap_multiple",
     "equity_share_pct",
     "term_years",
+    # Return metrics
     "expected_irr_base",
     "cap_exceedance_prob",
     "log_investment",
